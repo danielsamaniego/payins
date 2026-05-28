@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Child repos — they are independent git repositories (own .git, own remote,
-# own deploy target). The umbrella only tracks orientation docs + the roadmap.
+# Child repos are registered as git submodules (see .gitmodules + README).
+# Each one is an independent git repository (own .git, own remote, own deploy
+# target). The umbrella pins them at a specific commit; bump with:
+#   git submodule update --remote --merge
 # ─────────────────────────────────────────────────────────────────────────────
-Kunfupay-Payins-Back/
-Kunfupay-Payins-Front/
 
 # Dependencies
 node_modules/

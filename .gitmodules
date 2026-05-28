@@ -1,0 +1,8 @@
+[submodule "Kunfupay-Payins-Back"]
+	path = Kunfupay-Payins-Back
+	url = git@github.com:danielsamaniego/payins-back.git
+	branch = main
+[submodule "Kunfupay-Payins-Front"]
+	path = Kunfupay-Payins-Front
+	url = git@github.com:danielsamaniego/payins-front.git
+	branch = main
