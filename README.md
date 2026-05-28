@@ -18,6 +18,30 @@ The backend is **platform-agnostic** (DDD + Hexagonal + CQRS, UUID v7, Unix-ms
 consume the backend's HTTP API; the only seam is a typed client generated from the
 backend's OpenAPI 3.1 spec.
 
+## Clone (with both children)
+
+The two child repos are registered as **git submodules**. Clone the umbrella
+with `--recurse-submodules` so both are checked out in one command:
+
+```bash
+git clone --recurse-submodules git@github.com:danielsamaniego/payins.git Kunfupay-Payins
+cd Kunfupay-Payins
+```
+
+If you already cloned without `--recurse-submodules`, hydrate them after the fact:
+
+```bash
+git submodule update --init --recursive
+```
+
+To pull the latest commits from each child's own `main`:
+
+```bash
+git submodule update --remote --merge
+git commit -am "bump submodules"
+git push
+```
+
 ## Quick start (per repo)
 
 ```bash

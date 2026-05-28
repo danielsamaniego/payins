@@ -18,21 +18,29 @@ child repo is fully independent and has its own canonical `AGENTS.md`.
 ## What lives at this umbrella level
 
 ```
-Kunfupay-Payins/
-├── AGENTS.md, CLAUDE.md, README.md       Umbrella orientation (this directory).
-├── PAYINS_SERVICE_PLAN.md                Cross-repo roadmap, scope, phases.
-├── Kunfupay-Payins-Back/                 Independent backend repo (see its AGENTS.md).
-│   └── docs/deployment.md                Back-specific deploy notes (Vercel + Docker).
-└── Kunfupay-Payins-Front/                Independent frontend repo (see its AGENTS.md).
-    └── docs/deployment.md                Front-specific deploy notes (Vercel + Docker).
+Kunfupay-Payins/                           git repo: danielsamaniego/payins
+├── AGENTS.md, CLAUDE.md, README.md        Umbrella orientation (this directory).
+├── PAYINS_SERVICE_PLAN.md                 Cross-repo roadmap, scope, phases.
+├── .gitmodules                            Registers the two children as git submodules.
+├── Kunfupay-Payins-Back/                  Submodule → danielsamaniego/payins-back.
+│   └── docs/deployment.md                 Back-specific deploy notes (Vercel + Docker).
+└── Kunfupay-Payins-Front/                 Submodule → danielsamaniego/payins-front.
+    └── docs/deployment.md                 Front-specific deploy notes (Vercel + Docker).
 ```
+
+The two children are **git submodules**, each pinned at a specific commit. Clone the
+umbrella with `--recurse-submodules` to bring them down in one shot
+(`git clone --recurse-submodules <umbrella-url>`); otherwise hydrate later with
+`git submodule update --init --recursive`. To bump the pin to each child's latest
+`main`: `git submodule update --remote --merge && git commit -am "bump submodules"`.
 
 Each child repo has its own `package.json`, `pnpm-lock.yaml`, `.npmrc`, `biome.json`,
 `Dockerfile`, `docker-compose*.yml`, `.husky/`, **and its own `docs/deployment.md`**
 (deployment is per-repo, not cross-cutting), and (in the front) `pnpm-workspace.yaml`
 + `turbo.json`. **Do not introduce monorepo plumbing at this level** — no root
 `package.json`, no `pnpm-workspace.yaml`, no `turbo.json`, no `docker-compose.*.yml`,
-no umbrella `docs/`.
+no umbrella `docs/`. The umbrella's only role is documentation routing + the
+submodule registry.
 
 ## Canonical Source
 
