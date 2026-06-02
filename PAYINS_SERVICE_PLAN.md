@@ -12,15 +12,15 @@
 
 **Payins** es un orquestador de pagos de entrada, multi‑tenant, multi‑país, multi‑moneda, multi‑proveedor, totalmente independiente. Recibe órdenes de pago de cualquier consumidor y las ejecuta contra múltiples proveedores (Stripe, Ebanx, …) por múltiples métodos (card, Pix, Boleto, PSE, Yape, Nequi, PLIN, MercadoPago, bank transfer, …) en múltiples países.
 
-Maneja, con el mismo peso, estas responsabilidades (todas v1):
+Maneja, con el mismo peso, estas responsabilidades (visión completa del servicio). El marcador **[hoy]** indica lo ya construido; **[roadmap]** lo planificado aún no implementado:
 
-1. **Pagos one‑time** (con sus reintentos, refunds, disputas).
-2. **Suscripciones** en sus tres arquetipos: auto‑proveedor (Stripe), managed por nosotros (Yape/Nequi/tarjeta guardada), y reminder.
-3. **Payment Links** — URLs reutilizables y one‑shot que generan checkouts bajo demanda.
-4. **Webhooks entrantes** — recibe, verifica firma, normaliza, deduplica y dispara eventos de dominio.
-5. **Webhooks salientes** — emite eventos firmados, propios y normalizados, a endpoints que los consumidores registran.
-6. **Contratos comerciales** — por `Account`, con términos de comisión y markup por combinación método × país × moneda.
-7. **Instrumentos guardados** — tokens de tarjeta y mandates de wallet, reusables entre pagos/suscripciones.
+1. **Pagos one‑time** (con sus reintentos, refunds, disputas). **[hoy]** Payment (agnóstico) + Attempt + Refund existen; reintento/fallback = nuevo Attempt sobre el mismo Payment. Las disputas se **parsean pero no se accionan** en v1 **[roadmap]**.
+2. **Suscripciones** en sus tres arquetipos: auto‑proveedor (Stripe), managed (Yape/Nequi/tarjeta guardada), reminder. **[roadmap]**
+3. **Payment Links** — URLs reutilizables que generan checkouts bajo demanda. **[roadmap]**
+4. **Webhooks entrantes** — recibe, verifica firma, normaliza, deduplica. **[hoy]** El dispatcher acciona CAPTURED/FAILED/REFUNDED(+parcial); chargebacks y checkout‑expired se parsean pero no se accionan en v1.
+5. **Webhooks salientes** — emite eventos firmados a endpoints que los integradores registran. **[hoy]** Enum cerrado de 5 eventos; encolado **directo** (el outbox `DomainEvent` está construido pero dormido).
+6. **Contratos comerciales** — por `Account`, con términos de comisión y markup por combinación método × país × moneda. **[hoy]**
+7. **Instrumentos guardados** — tokens de tarjeta y mandates de wallet, reusables. **[roadmap]**
 
 **Principios no‑negociables** (idénticos a Wallet):
 
@@ -179,8 +179,8 @@ El sistema actual de payins en Kunfupay ([src/_payments/back/](../Kunfupay/Kunfu
 - **Application**: comandos (writes) y queries (reads). Orquestan dominio a través de puertos.
 - **Infrastructure**: adapters concretos (Prisma repositories, HTTP clients de proveedores, webhook verifiers, outbound dispatcher).
 - **Presentation**: handlers HTTP (Hono), schemas Zod, specs OpenAPI.
-- **No event sourcing**. Sí un **event log** persistente para auditoría y para alimentar webhooks salientes.
-- **Concurrencia de dos capas** (idéntica a Wallet): capa externa = lock distribuido `LockRunner` (`utils/application/lock.runner.ts`, respaldado por Redis/Upstash) que envuelve la transacción; capa interna = optimistic locking (`version`) + aislamiento `Serializable`. El `TransactionManager` reintenta la capa interna **5 veces** (full‑jitter backoff, techos 30/60/120/240ms); agotado → `409 VERSION_CONFLICT`. Timeout de espera del lock → `409 LOCK_CONTENDED`. Lock FIRST, tx SECOND. Prefijos de key: `payment-lock:<id>`, `subscription-lock:<id>`, `checkout-lock:<id>`, `invoice-lock:<id>`. Para comandos keyed por recurso derivado (un refund recibe `paymentId`), se valida la propiedad del tenant **fuera del lock** antes de bloquear. Si Redis no está disponible, el runner cae transparentemente al optimistic locking.
+- **No event sourcing**. Sí un **event log** persistente para auditoría y, **a futuro**, para alimentar webhooks salientes. **Estado hoy:** el outbox (`common/events`: entidad `DomainEvent` + puerto `IEventPublisher` + `PrismaEventStore`, tabla `domain_events`) está **construido pero no cableado** — ningún use case emite `DomainEvent` todavía. En v1 los webhooks salientes se encolan **directamente** por el dispatcher de webhooks entrantes (`OutboundWebhookDelivery.eventId` es nullable y queda `null` en este camino directo). El proyector evento→delivery es trabajo futuro (§15.2 Fase 2).
+- **Concurrencia de dos capas** (idéntica a Wallet): capa externa = lock distribuido `LockRunner` (`utils/application/lock.runner.ts`, respaldado por Redis/Upstash) que envuelve la transacción; capa interna = optimistic locking (`version`) + aislamiento `Serializable`. El `TransactionManager` reintenta la capa interna hasta **3 intentos** (backoff exponencial determinista, 30ms / 60ms, sin jitter; `MAX_RETRIES=3` en `prisma.transaction.manager.ts`); agotado → `409 VERSION_CONFLICT`. Timeout de espera del lock → `409 LOCK_CONTENDED`. Lock FIRST, tx SECOND. Prefijos de key: `payment-lock:<id>`, `subscription-lock:<id>`, `checkout-lock:<id>`, `invoice-lock:<id>`. Para comandos keyed por recurso derivado (un refund recibe `paymentId`), se valida la propiedad del tenant **fuera del lock** antes de bloquear. Si Redis no está disponible, el runner cae transparentemente al optimistic locking.
 - **TrackingId + canonical log** por request.
 - **Idempotency middleware** atómico (acquire → execute → complete).
 - **AppError + ErrorKind + Code** homogéneo.
@@ -357,25 +357,25 @@ Las columnas que en otros diseños habrían sido FK a estas tablas almacenan `TE
 
 #### ProviderConnection
 
-Credenciales del `(Platform × provider)`. Encriptadas at‑rest.
+Credenciales del `(Platform × provider)`. Encriptadas at‑rest. **`platformId` es nullable:** `NULL` denota una conexión global/compartida (Merchant‑of‑Record, default de Payins); con valor es BYOC (tenant‑owned). El resolver prefiere la conexión del tenant.
 
 | campo | tipo | notas |
 |---|---|---|
 | id | `con_UUIDv7` | PK |
-| platformId | FK → `Platform` | |
+| platformId | FK → `Platform` **nullable** | `NULL` = global/MoR compartida; con valor = BYOC del tenant |
 | providerSlug | `TEXT` | validado contra el enum `ProviderSlug` (sin FK; catálogo en código) |
-| label | `TEXT` | "Stripe Main", "Stripe Backup" (permite varias del mismo provider) |
-| livemode | `BOOLEAN` | debe coincidir con el Platform |
-| credentialsCiphertext | `BYTEA` | libsodium sealed box del JSON de credenciales |
-| credentialsFingerprint | `TEXT` | hex prefix, visible al usuario para distinguir versiones |
-| webhookSigningSecret | `BYTEA` | secret del lado del **provider** para verificar firmas entrantes (encriptado) |
-| status | `ENUM` | `ACTIVE \| DISABLED` |
-| healthCheckedAt | `BIGINT (Unix ms)` nullable | |
+| label | `TEXT` | "Ebanx Retail", "Stripe Backup" (permite varias del mismo provider) |
+| credentialsCiphertext | `BYTEA` | libsodium sealed box del JSON de credenciales. **El secret de webhook del provider** (para verificar firmas entrantes) vive **dentro** de este blob encriptado — no hay columna dedicada. |
+| credentialsFingerprint | `TEXT` | SHA‑256 hex del plaintext, visible al usuario para distinguir versiones |
+| livemode | `BOOLEAN` | default `true` |
+| status | `ENUM` (`TEXT`) | `active \| revoked` (default `active`) |
+| version | `INT` | |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
 **Invariantes:**
-- `UNIQUE (platformId, providerSlug, label)`.
+- `UNIQUE (platformId, providerSlug, label)`; además un índice parcial único garantiza "una sola conexión global por provider" (`platform_id IS NULL`).
 - Credenciales nunca en logs (filtro obligatorio).
+- El secret de verificación de webhooks entrantes **no** es una columna aparte: forma parte de las credenciales encriptadas.
 
 #### ProviderCapability
 
@@ -388,20 +388,26 @@ La **matriz de routing**. Es una tabla de DB poblada por tenant.
 | paymentMethodSlug | `TEXT` | validado contra el enum `PaymentMethodSlug` (sin FK; catálogo en código) |
 | country | `CHAR(2)` | ISO-2 |
 | currency | `CHAR(3)` | ISO-3 |
-| flowType | `ENUM` | `REDIRECT \| REDIRECT_ASYNC \| ONSITE_TOKEN \| ONSITE_DIRECT \| ENROLLMENT` |
+| flowType | `ENUM` (`TEXT`) | `REDIRECT \| ONSITE_TOKEN \| REDIRECT_ASYNC \| DISPLAY \| ENROLLMENT \| PUSH_TO_APP` (enum `FLOW_TYPES` en `utils/kernel/flow-types.ts`; `ONSITE_DIRECT` es trabajo futuro, no existe aún) |
 | recurrenceStrategy | `ENUM` | `NONE \| AUTO_PROVIDER \| MANAGED \| REMINDER` |
-| priority | `INT` | menor = preferido cuando varias capabilities matchean |
+| priority | `INT` | default `100`; menor = preferido cuando varias capabilities matchean |
 | minAmount | `BIGINT` nullable | en currency minor units |
 | maxAmount | `BIGINT` nullable | |
-| config | `JSONB` | parámetros específicos del proveedor (ej. `payment_type_code` de Ebanx) |
-| enabled | `BOOLEAN` | |
+| config | `JSONB` | parámetros específicos del proveedor (ej. `payment_type_code` de Ebanx, `require_3ds`) |
+| label | `TEXT` | label legible (ej. "Ebanx Card PE 1‑500 PEN") |
+| buyerFieldRequirements | `JSONB` | campos del comprador requeridos/opcionales para este método |
+| enabled | `BOOLEAN` | default `true` |
+| fallbackBehavior | `ENUM` (`TEXT`) | `NEVER_FALLBACK \| FALLBACK_ON_ERROR` |
+| healthScore | `INT` | 0‑100, mantenido por job de background; default `100` |
+| platformId | FK → `Platform` **nullable** | `NULL` = global; con valor = override del tenant (futuro) |
+| version | `INT` | |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
 **Invariantes:**
 - `currency` y `country` deben estar en las listas soportadas del provider (definidas en el catálogo de código `utils/kernel/`, ver §5.2).
-- La unicidad es por `id`; la disjunción de rangos de monto es operacional, no DB‑enforced. El resolver desambigua por `priority + rango + createdAt`.
+- Unicidad por la tupla `(platformId, providerSlug, paymentMethodSlug, country, currency, flowType, recurrenceStrategy)`; la disjunción de rangos de monto es operacional, no DB‑enforced.
 
-**Resolución en tiempo de pago**: dado `(platformId, paymentMethodSlug, country, currency, amount, flowType, recurrenceStrategy)`, se seleccionan las capabilities con `enabled=true`, dentro de rango de monto, ordenadas por `priority ASC, createdAt DESC`. Primera gana; si ninguna → `NO_CAPABILITY_MATCH`.
+**Resolución en tiempo de pago**: dado `(platformId, paymentMethodSlug, country, currency, amount, flowType, recurrenceStrategy)`, se seleccionan las capabilities con `enabled=true`, dentro de rango de monto. El resolver (`providerCapability.repo.ts`) ordena por `platformId ASC (nulls last) → priority DESC → healthScore DESC → createdAt ASC`; la primera gana y las siguientes forman la cadena de fallback. (Nota: el comentario del schema dice "LOWER priority = preferred / ORDER BY priority ASC", pero el adapter ejecutado ordena `priority DESC` — inconsistencia interna conocida del código.) Si ninguna matchea → error de routing (`ErrProviderCapabilityNotFound`).
 
 ### 5.4 Bounded context: `contract`
 
@@ -418,7 +424,7 @@ Términos comerciales por `Account`. Separados de la configuración técnica.
 | status | `ENUM` | `DRAFT \| ACTIVE \| TERMINATED` |
 | effectiveFrom | `BIGINT (Unix ms)` | |
 | effectiveUntil | `BIGINT (Unix ms)` nullable | null = vigente indefinidamente |
-| commissionCurrency | `CHAR(3)` | currency de facturación de las comisiones |
+| currency | `CHAR(3)` | currency de facturación de las comisiones (columna `currency`; v1 debe igualar `Payment.currency`). Solo `Payment` tiene una columna `commissionCurrency`. |
 | version | `INT` | optimistic lock |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
@@ -461,7 +467,9 @@ Redondeo **half‑even** (banker's rounding) a la unidad entera. Persistido en `
 
 **Nota:** el `markup` se aplica **antes** de crear el `Payment` si el consumidor lo delega (ej. consumidor pide "cóbrale 100€, gestiona el markup"). Por defecto, el consumidor ya viene con el `amount` final y markup = 0.
 
-### 5.5 Bounded context: `customer`
+### 5.5 Bounded context: `customer` — **planificado, no implementado todavía**
+
+> El BC `customer` y su tabla `customers` no existen aún en el código (Fase C). El diseño abajo es el target.
 
 Wrapper opaco del usuario final. Útil para agrupar instrumentos y suscripciones.
 
@@ -482,7 +490,9 @@ Wrapper opaco del usuario final. Útil para agrupar instrumentos y suscripciones
 
 `UNIQUE (platformId, accountId, externalReference)` — el mismo `externalReference` puede existir bajo dos Accounts distintos.
 
-### 5.6 Bounded context: `instrument`
+### 5.6 Bounded context: `instrument` — **planificado, no implementado todavía**
+
+> El BC `instrument` y su tabla `instruments` no existen aún en el código (Fase C). El diseño abajo es el target.
 
 Unifica card tokens y wallet/bank mandates.
 
@@ -516,7 +526,9 @@ Unifica card tokens y wallet/bank mandates.
 
 ### 5.7 Bounded context: `checkout`
 
-#### Checkout
+> **Estado hoy:** este BC se implementa como **`paymentSession`** (tabla `payment_sessions`), que respalda la página de checkout del comprador. La tabla `payment_sessions` real tiene los campos: `id`, `platformId`, `accountId`, `customerId?`, `mode` (`ONE_TIME \| SUBSCRIPTION_SETUP`; **v1 solo `ONE_TIME`**), `amount?`, `currency?`, `country?`, `allowedPaymentMethodSlugs?`, `saveInstrument`, `successUrl`, `cancelUrl`, `expiresAt`, `status` (`OPEN \| COMPLETED \| EXPIRED \| CANCELED`), `resolvedCapabilityId?`, `paymentId?`, `instrumentId?`, `reference?`, `metadata`, `version`, timestamps. **No existe** la tabla `payment_links` ni el aggregate `PaymentLink` — ese subdiseño (`PaymentLink`, `/l/:slug`) es **planificado, no implementado**. El diseño `Checkout`/`PaymentLink` abajo es el target conceptual.
+
+#### Checkout (target — implementado como `PaymentSession`)
 
 Sesión de pago o de suscripción. Unifica lo que en el sistema de referencia eran dos entidades.
 
@@ -556,9 +568,9 @@ Sesión de pago o de suscripción. Unifica lo que en el sistema de referencia er
 - `mode=ONE_TIME` ⇒ `amount` y `currency` obligatorios.
 - `mode=SUBSCRIPTION_SETUP` ⇒ `planId` obligatorio.
 
-#### PaymentLink
+#### PaymentLink — **planificado, no implementado todavía**
 
-URL reutilizable que genera Checkouts.
+URL reutilizable que genera Checkouts. (No existe en el código actual; ver nota de §5.7.)
 
 | campo | tipo | notas |
 |---|---|---|
@@ -592,49 +604,58 @@ URL reutilizable que genera Checkouts.
 
 ### 5.8 Bounded context: `payment`
 
-#### Payment (aggregate root)
+#### Payment (aggregate root) — **gateway‑AGNÓSTICO**
+
+El `Payment` representa la **intención de cobro** y **no conoce el provider**: no tiene `capabilityId`, `providerSlug`, ni `providerPaymentId`. La **ruta** (qué provider/conexión/capability se usó) vive **en el `Attempt`**. Reintento/fallback = un **nuevo `Attempt`** sobre el **mismo `Payment`** — por eso la ruta no puede estar fijada en el Payment. El origen es **polimórfico y opcional** (`paymentSessionId` / `invoiceId` / `subscriptionId` / `instrumentId`, todos nullable).
 
 | campo | tipo | notas |
 |---|---|---|
 | id | `pay_UUIDv7` | PK |
 | platformId | FK | denormalizado |
 | accountId | FK → `Account` | account propietario; dirige la resolución de Contract |
-| customerId | FK nullable | |
-| checkoutId | FK nullable | |
-| subscriptionId | FK nullable | si fue generado por una suscripción |
-| invoiceId | FK nullable | si fue generado por un invoice |
-| instrumentId | FK nullable | si se usó credencial guardada |
-| capabilityId | FK → `ProviderCapability` | ruta elegida, inmutable tras creación |
+| paymentSessionId | FK nullable | origen: checkout hosted |
+| invoiceId | columna escalar nullable | origen: renovación de suscripción (FK en Fase C) |
+| subscriptionId | columna escalar nullable | link de conveniencia (FK en Fase C) |
+| customerId | columna escalar nullable | Fase C |
+| instrumentId | columna escalar nullable | si se usó credencial guardada (Fase C) |
+| requestedMethodSlug | `TEXT` | método **lógico** que eligió el pagador (validado vs `PaymentMethodSlug`) |
+| contractTermId | FK nullable | término SELL aplicado (se fija al capturar) |
 | amount | `BIGINT` | minor units del `currency` |
 | currency | `CHAR(3)` | |
-| country | `CHAR(2)` | |
-| description | `TEXT` nullable | |
-| reference | `TEXT` nullable | idempotencia opcional por parte del consumidor (`UNIQUE (platformId, reference) WHERE NOT NULL`) |
+| country | `CHAR(2)` nullable | |
+| buyer | `JSONB` | snapshot de los campos canónicos del comprador (PII) |
+| commissionAmount | `BIGINT default 0` | SELL congelada al capturar desde el `ContractTerm` |
+| commissionCurrency | `CHAR(3) nullable` | currency del Contract; null hasta capturar (puede diferir del Payment) |
 | status | `ENUM` | `CREATED \| AUTHORIZED \| CAPTURED \| FAILED \| EXPIRED \| REFUNDED \| PARTIALLY_REFUNDED \| CHARGED_BACK` |
-| providerPaymentId | `TEXT` nullable | id en el provider (se llena al primer intento) |
-| commissionAmount | `BIGINT default 0` | computada desde `ContractTerm` al capturar |
-| commissionCurrency | `CHAR(3) nullable` | currency del Contract (puede diferir del Payment) |
-| contractTermId | FK nullable | qué término se aplicó |
+| statusReason | `TEXT` nullable | motivo legible del estado actual |
+| nextAction | `JSONB` nullable | `NextAction` (unión discriminada); null si no hay acción pendiente |
+| totalRefundedAmount | `BIGINT default 0` | |
+| reference | `TEXT` nullable | idempotencia opcional por parte del consumidor (`UNIQUE (platformId, reference) WHERE NOT NULL`) |
 | metadata | `JSONB` | |
 | version | `INT` | |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
-| authorizedAt, capturedAt, failedAt, expiredAt | `BIGINT (Unix ms)` nullable | |
+| authorizedAt, capturedAt, failedAt, expiredAt, refundedAt, chargedBackAt | `BIGINT (Unix ms)` nullable | |
 
-#### Attempt
+#### Attempt — **donde vive la ruta del provider**
 
-Cada interacción con el provider es un attempt persistido (audit + debugging).
+Cada ejecución ROUTED contra un gateway es un `Attempt` persistido (audit + debugging + base del fallback). Es append‑only: N por `Payment`. Aquí están **todas** las columnas de ruta que el Payment ya no tiene.
 
 | campo | tipo | notas |
 |---|---|---|
 | id | `att_UUIDv7` | PK |
 | paymentId | FK | |
-| sequence | `INT` | 1, 2, 3 |
+| sequence | `INT` | 1, 2, 3 (`UNIQUE (paymentId, sequence)`) |
+| connectionId | FK → `ProviderConnection` | qué credenciales se usaron |
+| capabilityId | FK → `ProviderCapability` | ruta elegida **para este intento** |
+| providerSlug | `TEXT` | provider de este intento |
+| providerPaymentId | `TEXT` nullable | id en el gateway (`UNIQUE (providerSlug, providerPaymentId)` cuando está seteado) |
 | status | `ENUM` | `PENDING \| SUCCESS \| FAILED` |
-| requestSnapshot | `JSONB` | payload enviado al provider (sanitizado) |
-| responseSnapshot | `JSONB` | respuesta del provider (sanitizado) |
+| requestSnapshot | `JSONB` | payload enviado al provider (sanitizado — sin PAN/CVV) |
+| responseSnapshot | `JSONB` | respuesta del provider (sanitizada) |
 | errorCode | `TEXT` nullable | código normalizado interno |
-| providerErrorCode | `TEXT` nullable | código del provider para debugging |
+| providerErrorCode | `TEXT` nullable | código crudo del provider para debugging |
 | errorMessage | `TEXT` nullable | |
+| providerCostAmount | `BIGINT` nullable | costo BUY congelado aquí (Fase D) |
 | latencyMs | `INT` | tiempo contra el provider |
 | occurredAt | `BIGINT (Unix ms)` | |
 
@@ -657,7 +678,9 @@ Cada interacción con el provider es un attempt persistido (audit + debugging).
 - El refund que iguale el total → `Payment.status = REFUNDED`.
 - Refund parcial → `Payment.status = PARTIALLY_REFUNDED`.
 
-#### Dispute
+#### Dispute — **planificado, no implementado todavía**
+
+> No existe tabla `disputes` ni aggregate `Dispute` en el código actual (la migración v1 no la crea). El dispatcher entrante **parsea** chargebacks pero **no actúa** sobre ellos en v1; el manejo de disputas es trabajo futuro. El diseño de tabla abajo es el target.
 
 | campo | tipo | notas |
 |---|---|---|
@@ -672,7 +695,9 @@ Cada interacción con el provider es un attempt persistido (audit + debugging).
 | dueBy | `BIGINT (Unix ms)` nullable | fecha límite si el provider la notifica |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
-### 5.9 Bounded context: `subscription`
+### 5.9 Bounded context: `subscription` — **planificado, no implementado todavía**
+
+> El BC `subscription` y sus tablas `plans` / `subscriptions` / `invoices` no existen aún en el código (Fase C). Los diseños abajo son el target.
 
 #### Plan
 
@@ -744,25 +769,30 @@ Una factura por ciclo de suscripción. Se crea *antes* del cobro, queda `OPEN`, 
 
 ### 5.10 BC `webhook-outbound` + features `common/events` y `common/inboundWebhooks`
 
-`webhook-outbound` es un BC (endpoints CRUD propios para el integrador). `DomainEvent` (outbox) vive en `common/events` y `InboundWebhookEvent` en `common/inboundWebhooks` — features cross‑cutting con DDD completo, **no** BCs. `WebhookEndpoint`, `DomainEvent` e `InboundWebhookEvent` son **Platform‑scoped** (infra compartida por todos los Accounts del Platform).
+`outboundWebhooks` es un BC (endpoints CRUD propios para el integrador; el plan lo nombraba `webhook-outbound`). `DomainEvent` (outbox) vive en `common/events` y `InboundWebhookEvent` en `common/inboundWebhooks` — features cross‑cutting con DDD completo, **no** BCs. `WebhookEndpoint`, `DomainEvent` e `InboundWebhookEvent` son **Platform‑scoped** (infra compartida por todos los Accounts del Platform).
 
-#### WebhookEndpoint (outbound — registrado por el consumidor) — BC `webhook-outbound`
+#### WebhookEndpoint (outbound — registrado por el consumidor) — BC `outboundWebhooks`
+
+El secret de firma se almacena **en plaintext** en una sola columna `signingSecret` (`TEXT`); la encriptación at‑rest (libsodium) es un hardening **diferido**, no implementado. No hay columnas `signingSecretCiphertext` ni `signingSecretFingerprint`. El integrador **provee** su propio `signing_secret` (mín. 32 chars) al registrar el endpoint; Payins **no genera ni devuelve** secret.
 
 | campo | tipo | notas |
 |---|---|---|
 | id | `whe_UUIDv7` | PK |
 | platformId | FK | |
 | url | `TEXT` | HTTPS obligatorio |
-| eventTypes | `TEXT[]` | wildcard permitido: `"payment.*"` |
-| signingSecretCiphertext | `BYTEA` | |
-| signingSecretFingerprint | `TEXT` | |
-| status | `ENUM` | `ACTIVE \| DISABLED` |
-| livemode | `BOOLEAN` | |
+| signingSecret | `TEXT` | **plaintext v1** (encrypt‑at‑rest diferido); provisto por el integrador |
+| subscribedEvents | `JSONB` | array de `OutboundEventType` (ver §5.13); enum **cerrado** de exactamente 5 |
+| status | `ENUM` (`TEXT`) | `active \| disabled` (default `active`) |
+| livemode | `BOOLEAN` | default `true` |
+| description | `TEXT` nullable | |
+| version | `INT` | |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
-#### DomainEvent — feature `common/events` (outbox, NO BC)
+#### DomainEvent — feature `common/events` (outbox, NO BC) — **construido pero no cableado**
 
-Log append‑only de todos los eventos de dominio publicados (auditoría + fuente para webhooks salientes). Cada BC que muta un aggregate persiste un `DomainEvent` en la misma transacción vía el port `IEventPublisher` (`utils/application/event-publisher.port.ts`).
+> **Estado hoy:** el outbox existe (entidad `DomainEvent`, puerto `IEventPublisher` en `utils/application/event-publisher.port.ts`, `PrismaEventStore`, tabla `domain_events`) **pero está dormido**: ningún use case emite `DomainEvent`, y no hay proyector evento→delivery. En v1 los webhooks salientes se encolan **directamente** (ver `WebhookDelivery` abajo). El diseño "cada mutación de BC persiste un `DomainEvent` en la misma transacción" es el **target**, no el comportamiento actual.
+
+Log append‑only diseñado para todos los eventos de dominio (auditoría + futura fuente para webhooks salientes).
 
 | campo | tipo | notas |
 |---|---|---|
@@ -770,29 +800,36 @@ Log append‑only de todos los eventos de dominio publicados (auditoría + fuent
 | platformId | FK | |
 | accountId | FK nullable | seteado cuando el evento es account‑scoped (la mayoría) |
 | type | `TEXT` | ej. `payment.captured` |
-| aggregateType | `TEXT` | `Payment`, `Subscription`, … |
+| aggregateType | `TEXT` | `Payment`, `Refund`, … |
 | aggregateId | `TEXT` | |
 | payload | `JSONB` | shape público estable del recurso |
 | livemode | `BOOLEAN` | |
 | occurredAt | `BIGINT (Unix ms)` | |
-| publishedAt | `BIGINT (Unix ms)` | cuando se encoló a webhooks |
+| publishedAt | `BIGINT (Unix ms)` nullable | cuando se proyectó por primera vez a deliveries (futuro) |
 
-#### WebhookDelivery (outbound) — BC `webhook-outbound`
+#### OutboundWebhookDelivery (outbound) — BC `outboundWebhooks`
+
+En v1 cada delivery se **encola directamente** por el dispatcher de webhooks entrantes (sin pasar por `DomainEvent`); por eso `eventId` es **nullable** y queda `null` en este camino directo (se llenará cuando aterrice el proyector del outbox).
 
 | campo | tipo | notas |
 |---|---|---|
 | id | `whd_UUIDv7` | PK |
 | endpointId | FK | |
-| eventId | FK → `DomainEvent` (en `common/events`) | |
-| status | `ENUM` | `PENDING \| DELIVERED \| FAILED_RETRY \| FAILED_DEAD` |
+| platformId | FK | |
+| eventId | FK → `DomainEvent` **nullable** | `null` en el camino directo v1; se setea cuando aterrice el proyector |
+| eventType | `TEXT` | uno de los 5 tipos del enum cerrado |
+| payload | `JSONB` | envelope entregado |
+| status | `ENUM` (`TEXT`) | `PENDING \| DELIVERED \| FAILED \| EXHAUSTED` (terminal: `EXHAUSTED`) |
 | attemptCount | `INT default 0` | |
-| nextAttemptAt | `BIGINT (Unix ms)` nullable | |
-| httpStatus | `INT` nullable | |
-| responseBodySample | `TEXT` nullable | primeros 2KB |
+| attempts | `JSONB` | array de `DeliveryAttempt` (inmutable una vez añadido) |
+| nextRetryAt | `BIGINT (Unix ms)` nullable | |
 | deliveredAt | `BIGINT (Unix ms)` nullable | |
+| failedAt | `BIGINT (Unix ms)` nullable | |
+| lastError | `TEXT` nullable | |
+| version | `INT` | |
 | createdAt, updatedAt | `BIGINT (Unix ms)` | |
 
-**Reintentos:** 1min → 5min → 30min → 2h → 6h → 12h → 24h (7 intentos). Después `FAILED_DEAD`. Consultable y re‑lanzable por API.
+**Reintentos:** 30s → 2min → 5min → 10min (`RETRY_DELAYS_MS` en `delivery.aggregate.ts`), máximo **5 intentos**; agotados → estado terminal `EXHAUSTED`. Consultable y re‑lanzable manualmente vía `POST /v1/webhook-deliveries/:id/retry`.
 
 #### InboundWebhookEvent — feature `common/inboundWebhooks` (NO BC)
 
@@ -1093,6 +1130,8 @@ Esto se enforza con el script [Kunfupay-Payins-Back/scripts/check-layer-violatio
 
 ## 7. Flujos end‑to‑end
 
+> **Nota de estado.** Los flujos abajo son el **target conceptual** y usan nombres de ruta del diseño original (`/v1/checkouts`, `/v1/subscriptions`, `/v1/payments/:id/refund`, `/l/:slug`). El **surface HTTP real montado hoy** es distinto (ver §8): el checkout vive en `/v1/payment-sessions` (+ `/c/*` público), los BCs de payment/refund/subscription **no tienen rutas HTTP** todavía, y no existen rutas de payment‑links. Además, donde estos flujos dicen "emite domain events → webhook dispatcher", la realidad v1 es que el dispatcher de webhooks **entrantes** encola la entrega **saliente directamente** (el outbox `DomainEvent` está construido pero dormido, ver §3.2 / §5.10).
+
 ### 7.1 Pago one‑time on‑site (card tokenizada)
 
 ```
@@ -1124,7 +1163,7 @@ consumer → POST /v1/checkouts/:id/start
          ← 200 { redirectUrl, … }
 (cliente paga en Pix)
 
-provider → POST /v1/webhooks/:providerSlug/:connectionId  (firma específica del provider)
+provider → POST /v1/webhooks/:provider  (firma específica del provider)
          ↓ adapter.verifyWebhook
          ↓ adapter.parseWebhook → PAYMENT_CAPTURED
          ↓ InboundWebhookEvent persistido (dedupe por providerEventId)
@@ -1172,7 +1211,7 @@ Crear suscripción:
            ← 201 { subscriptionId, firstPaymentId }
 
 Renovación (cron nightly):
-  GET /v1/internal/cron/subscriptions/renew  (header X-Cron-Secret)
+  GET /v1/internal/cron/subscriptions/renew  (roadmap — no montado; auth Authorization: Bearer <CRON_SECRET>)
          ↓ para cada Subscription con nextInvoiceAt <= now AND status IN (ACTIVE, PAST_DUE):
            - idempotency key = (subscriptionId, currentCycleNumber)
            - crea Invoice si no existe
@@ -1212,9 +1251,13 @@ consumer → POST /v1/payments/:id/refund { amount, reason:"REQUESTED_BY_CUSTOME
 
 ## 8. API HTTP (v1)
 
-Prefijo `/v1`. Auth `Authorization: Bearer pk_{live|test}_…`. Todo POST admite `Idempotency-Key`.
+Prefijo `/v1`. **Auth real:** header `X-API-Key: <apiKeyId>.<secret>` (no `Authorization: Bearer`); el Account se selecciona vía header `X-Account-Id` (no en el body). Key ausente → `MISSING_API_KEY`; key malformada/desconocida/revocada → `INVALID_API_KEY`. Todo POST admite `Idempotency-Key`.
 
-### 8.1 Consumer‑facing
+> **Nota de estado — surface realmente montado (`src/app.ts`).** Hoy el back monta: `/v1/platforms`, `/v1/payment-sessions` (+ `GET /:id/available-methods`, `POST /:id/confirm`), `/v1/webhooks/:provider` (entrantes), `/v1/webhook-endpoints`, `/v1/webhook-deliveries`, el checkout público bajo `/c/*`, los crons bajo `/internal/cron/*`, más `/health`, `/openapi`, `/docs`. **No existen** (son roadmap): `/v1/checkouts`, `/v1/payments`, `/v1/refunds`, `/v1/subscriptions`, `/v1/plans`, `/v1/invoices`, `/v1/instruments`, `/v1/customers`, `/v1/payment-links`, `/v1/payment-methods`, `/v1/events`, `/v1/admin/*`, `/l/:slug`, `/pay/:id`, ni `/ready`. El BC `payment` **no tiene adapter HTTP**. La tabla abajo es el **target**; las filas no listadas en esta nota están sin montar.
+>
+> El confirm real es `POST /v1/payment-sessions/:id/confirm` y devuelve una **unión discriminada** por `kind` (`{kind:'redirect'}` o `{kind:'onsite_token_prepared'}`), sin envelope `next_action`.
+
+### 8.1 Consumer‑facing (target — ver nota de estado para lo realmente montado)
 
 | Método | Ruta | Propósito |
 |---|---|---|
@@ -1274,21 +1317,27 @@ Prefijo `/v1`. Auth `Authorization: Bearer pk_{live|test}_…`. Todo POST admite
 
 | Método | Ruta | Propósito |
 |---|---|---|
-| POST | `/v1/webhooks/:providerSlug/:connectionId` | provider notifica; firma verificada por adapter |
+| POST | `/v1/webhooks/:provider` | provider notifica; firma verificada por adapter. No hay segmento `:connectionId` en la URL (el `connectionId` se usa solo para dedupe interno). |
 
-### 8.5 Crons (protegido con `X-Cron-Secret`)
+### 8.5 Crons (protegido con `Authorization: Bearer <CRON_SECRET>`)
 
-| Método | Ruta |
-|---|---|
-| POST | `/v1/internal/cron/subscriptions/renew` |
-| POST | `/v1/internal/cron/subscriptions/reminders` |
-| POST | `/v1/internal/cron/checkouts/expire` |
-| POST | `/v1/internal/cron/instruments/health-check` |
-| POST | `/v1/internal/cron/webhook-deliveries/retry` |
+El **único cron montado hoy** es un `GET` sin prefijo `/v1` (montado vía
+`app.basePath("/internal")` en `src/app.ts`), autenticado por
+`Authorization: Bearer <CRON_SECRET>` (no existe ningún header `X-Cron-Secret` en el
+código). Las demás filas son **roadmap — no montadas** (sus BCs no están construidos).
+
+| Método | Ruta | Estado |
+|---|---|---|
+| GET | `/internal/cron/cleanup-idempotency` | montado hoy |
+| POST | `/v1/internal/cron/subscriptions/renew` | roadmap — no montado |
+| POST | `/v1/internal/cron/subscriptions/reminders` | roadmap — no montado |
+| POST | `/v1/internal/cron/checkouts/expire` | roadmap — no montado |
+| POST | `/v1/internal/cron/instruments/health-check` | roadmap — no montado |
+| POST | `/v1/internal/cron/webhook-deliveries/retry` | roadmap — no montado |
 
 ### 8.6 Sistema
 
-`/health`, `/ready`, `/docs`, `/openapi.json`.
+Montados hoy: `/health` (devuelve `{status, version, db}`, con `status:'degraded'` ante fallo de DB), `/docs` (Scalar) y `/openapi` (spec OpenAPI 3.1). **No existe** `/ready` (es roadmap).
 
 ---
 
@@ -1296,36 +1345,33 @@ Prefijo `/v1`. Auth `Authorization: Bearer pk_{live|test}_…`. Todo POST admite
 
 ### 9.1 Firma
 
-Header: `X-Payins-Signature: t=<unix_ms>,v1=<hex_hmac_sha256>`.
+**Dos headers** (no uno solo): `X-Payins-Timestamp: <unix_ms>` y `X-Payins-Signature: v1=<hex_hmac_sha256>`.
 
-HMAC se calcula sobre `<unix_ms>.<raw_body>` con el `signingSecret` del endpoint. Clock skew tolerado: 5 minutos.
+El HMAC‑SHA256 se calcula sobre `${timestamp}.${raw_body}` con el `signingSecret` del endpoint (provisto por el integrador al registrar). Los eventos suscritos son un enum **cerrado de exactamente 5**: `payment.captured`, `payment.failed`, `payment.expired`, `refund.succeeded`, `refund.failed` (no se aceptan wildcards como `payment.*`).
 
 ### 9.2 Shape del payload
 
+El envelope entregado es:
+
 ```json
 {
-  "id": "evt_018f...",
-  "type": "payment.captured",
-  "occurredAt": "2026-04-17T12:34:56.789Z",
-  "livemode": true,
-  "platformId": "plat_018f...",
-  "accountId": "acc_018f...",
-  "data": {
-    "object": "payment",
-    "payment": { /* shape público estable */ }
-  }
+  "event_id": "evt_018f...",
+  "event_type": "payment.captured",
+  "created_at": 1776422096789,
+  "delivered_at": 1776422096900,
+  "attempt": 1,
+  "platform_id": "plat_018f...",
+  "payload": { /* shape público estable del recurso */ }
 }
 ```
 
-`occurredAt` se renderiza como UTC ISO‑8601 con ms **solo en este payload público** de webhook saliente; internamente y en DB es Unix‑ms (BigInt), única representación end‑to‑end.
+Los timestamps (`created_at`, `delivered_at`) son **Unix‑ms como `number`**, no strings ISO‑8601 — coherente con la representación única end‑to‑end del servicio.
 
 ### 9.3 Entrega y reintentos
 
-- Timeout 10s.
-- 7 intentos exponenciales (1min, 5min, 30min, 2h, 6h, 12h, 24h).
-- Orden de entrega **no** garantizado (usar `occurredAt`).
-- Dedupe por `event.id`.
-- Replay manual disponible via API (`POST /v1/events/:id/replay`).
+- 5 intentos: 30s → 2min → 5min → 10min (ver §5.10); agotados → estado terminal `EXHAUSTED`.
+- Orden de entrega **no** garantizado.
+- Replay manual disponible vía API: `POST /v1/webhook-deliveries/:id/retry`.
 
 ---
 
@@ -1333,14 +1379,14 @@ HMAC se calcula sobre `<unix_ms>.<raw_body>` con el `signingSecret` del endpoint
 
 1. **API keys**: prefix visible (`apiKeyId`) + argon2id del secret (`apiKeyHash`), ambos sobre el `Platform`. Revocación inmediata.
 2. **Provider credentials**: encriptadas at‑rest con libsodium sealed box. Master key en env/KMS. Nunca logged.
-3. **Webhook signing secrets (salientes)**: generados aleatorios 64 chars, mostrados solo al crear.
+3. **Webhook signing secrets (salientes)**: el integrador **provee** su propio secret (mín. 32 chars) al registrar el endpoint; Payins no lo genera ni lo devuelve. Se almacena **en plaintext** en v1 (`WebhookEndpoint.signingSecret`); encrypt‑at‑rest es un hardening diferido.
 4. **Webhooks entrantes**: firma verificada **antes** de parsear. Body raw capturado antes de cualquier parser JSON. Adapters custom por provider.
-5. **PCI**: Payins **nunca** acepta PAN/CVV. Solo tokens del provider. Gate de CI (en el repo del back): `rg -iE "pan|cvv|card.?number"` fuera de `src/provider-adapters/` debe ser vacío (cubre `card_number`, `cardNumber`, `card-number`, `cardnumber`).
+5. **PCI**: Payins **nunca** acepta PAN/CVV. Solo tokens del provider. Regla de gate: `rg -iE "pan|cvv|card.?number"` fuera de `src/provider-adapters/` debe ser vacío. **Estado:** esta es una regla de política; el gate **aún no está cableado** en CI (CI solo corre biome + tsc + tests; pre‑commit corre biome + `check-layer-violations.cjs` + `check-financial-patterns.cjs`).
 6. **TLS** obligatorio en prod.
 7. **Rate limiting**: 100 req/min por `connectionId` en `/v1/webhooks/…`; 600 req/min por API key en API consumer.
 8. **Idempotency** en todos los mutadores.
 9. **Concurrencia de dos capas**: lock distribuido externo (`LockRunner`, Redis) + optimistic locking interno (`version`) + `Serializable`, en Payment, Subscription, Checkout, Invoice, Contract, Instrument. **Lock FIRST, tx SECOND**; keys `payment-lock:<id>`, `subscription-lock:<id>`, `checkout-lock:<id>`, `invoice-lock:<id>`. La propiedad del tenant de keys derivadas se valida **fuera del lock** (un key cross‑tenant sin validar es un vector de DoS).
-10. **Reintentos de transacción**: el `TransactionManager` reintenta la capa interna **5 veces** (full‑jitter backoff, techos 30/60/120/240ms); agotado → `409 VERSION_CONFLICT`; timeout del lock externo → `409 LOCK_CONTENDED`. Ambos son transitorios: el cliente reintenta con la misma idempotency key.
+10. **Reintentos de transacción**: el `TransactionManager` reintenta la capa interna hasta **3 intentos** (backoff exponencial determinista 30ms / 60ms, sin jitter; `MAX_RETRIES=3`); agotado → `409 VERSION_CONFLICT`; timeout del lock externo → `409 LOCK_CONTENDED`. Ambos son transitorios: el cliente reintenta con la misma idempotency key.
 11. **Sensitive key filter** en logs (recursivo): `pan, cvv, card_number, secret, token, bearer, authorization, cookie, api_key, api_key_hash, signing_secret, credentials, password, phone, email`.
 12. **Tenant isolation**: el `Platform` es el tenant. Cada repositorio recibe `platformId` (y, en entidades account‑scoped, `accountId`) en el scope de la request; queries sin esos filtros fallan en tests. Aislamiento de Platform **y** de Account (toda escritura account‑scoped verifica `account.platformId = platform.id`).
 
@@ -1382,21 +1428,32 @@ Estándar idéntico a Wallet.
 
 ## 13. Despliegue
 
-Docker multi‑stage Node 22 Alpine. `docker-compose.dev.yml` + `docker-compose.test.yml` con puertos aislados. Migraciones Prisma con `prisma migrate deploy`. Crons en Vercel Cron / EventBridge protegidos con `X-Cron-Secret`. Master key de credenciales en secret manager.
+Docker multi‑stage Node 22 Alpine. `docker-compose.dev.yml` + `docker-compose.test.yml` con puertos aislados. Migraciones Prisma con `prisma migrate deploy`. Crons en Vercel Cron / EventBridge protegidos con `Authorization: Bearer <CRON_SECRET>` (el único cron montado hoy es `GET /internal/cron/cleanup-idempotency`, sin prefijo `/v1`; ver §8.5). Master key de credenciales en secret manager.
 
 ### Env vars
+
+Variables realmente leídas por `src/config.ts` (+ overrides de los adapters):
 
 ```
 DATABASE_URL
 DIRECT_URL
-HTTP_PORT=3000
-LOG_LEVEL=info
+HTTP_PORT
+LOG_LEVEL
 CRON_SECRET
 CREDENTIAL_MASTER_KEY      # libsodium
-LIVEMODE=false|true
-ADMIN_API_KEY
-BASE_PUBLIC_URL            # para Payment Link slugs
+REDIS_URL                  # lock distribuido (cuando PAYINS_LOCK_ENABLED=true)
+PAYINS_LOCK_ENABLED
+PAYINS_LOCK_TTL_MS
+PAYINS_LOCK_WAIT_MS
+PAYINS_LOCK_RETRY_MS
+PAYINS_LOCK_TRANSPORT      # redis | upstash-rest
+STRIPE_API_BASE_URL        # override (e2e → stripe-mock); unset en prod
+EBANX_API_BASE_URL         # override (e2e → ebanx-mock); unset en prod
 ```
+
+> **Planificadas, aún NO consumidas por el código:** `LIVEMODE`, `ADMIN_API_KEY`, `BASE_PUBLIC_URL` no se leen en ningún lugar de `src/`. `livemode` es una columna por‑`ProviderConnection`, no un toggle global de env; `ADMIN_API_KEY` correspondería al BC `iam`/rutas `/v1/admin/*` aún no construidas; `BASE_PUBLIC_URL` sería para slugs de payment‑links no implementados. No las marques como requeridas.
+
+`docker:dev` y `start:local` aplican migraciones con `pnpm db:deploy` (`prisma migrate deploy`), **no** `db:push`. Ambos compose levantan también Redis (`:1468`).
 
 ---
 
@@ -1414,12 +1471,14 @@ Qué haga el consumidor con `payment.captured` (acreditar Wallet, marcar Sale, e
 
 Todo `Platform` tiene **uno o más `Account`s**. Contratos, customers, instruments, pagos, suscripciones y planes siempre cuelgan de un `Account` — nunca del `Platform` directamente. Esto es uniforme sin importar el modelo de negocio del integrador:
 
+El Account se selecciona vía el header **`X-Account-Id`** (no en el body):
+
 | Tipo de integrador | Accounts por Platform | Notas |
 |---|---|---|
-| Simple / direct      | **1** (auto‑creado al registrar el Platform) | `accountId` puede omitirse en las requests; el sistema resuelve al único Account activo. |
-| Agregador / marketplace | **N** (uno por sub‑merchant)              | `accountId` obligatorio en toda operación. Cada Account tiene su contrato comercial. |
+| Simple / direct      | **1** (auto‑creado al registrar el Platform) | `X-Account-Id` puede omitirse; el sistema resuelve al Account activo más antiguo. |
+| Agregador / marketplace | **N** (uno por sub‑merchant)              | `X-Account-Id` debe indicarse para apuntar al sub‑merchant correcto. Cada Account tiene su contrato comercial. |
 
-**No existe un flag `mode` en el Platform.** La distinción emerge del número de Accounts. Esto mantiene el schema uniforme (`accountId FK NOT NULL` en todas las entidades account‑scoped) y el mismo código sirve para ambos casos de uso. `ProviderConnection` y `ProviderCapability` siguen siendo del Platform — los Accounts comparten la infraestructura con proveedores.
+**No existe un flag `mode` en el Platform.** La distinción emerge del número de Accounts. Esto mantiene el schema uniforme (`accountId FK NOT NULL` en todas las entidades account‑scoped) y el mismo código sirve para ambos casos de uso. `ProviderConnection` y `ProviderCapability` siguen siendo del Platform — los Accounts comparten la infraestructura con proveedores. (Nota: la auto‑creación del Account `"default"` al registrar un Platform es comportamiento **target**; el use case de registro de Platform aún no está construido.)
 
 Detalle completo del modelo en [Kunfupay-Payins-Back/docs/datamodel.md](Kunfupay-Payins-Back/docs/datamodel.md) secciones 1.2 (Account), 5 (Contract resolution) y 16 (invariantes).
 
@@ -1443,8 +1502,19 @@ El orden y los contenidos siguen el mapa de migraciones canónico en
 fase añade exactamente las migraciones indicadas; no hay migración de `catalog`
 (providers/métodos/países/monedas son enums en `utils/kernel/`).
 
+> **Estado real del esquema.** Los nombres lógicos de migración por fase abajo
+> (`001_init`, `002_routing`, …) son el **mapa de planificación**. En el repo hoy existe
+> **una sola migración** consolidada, `prisma/migrations/20260601161132_core_payins`
+> (nombre con timestamp, sin secuencia zero‑padded), que crea las **15 tablas** del core:
+> `platforms`, `accounts`, `provider_connections`, `provider_capabilities`, `contracts`,
+> `contract_terms`, `payment_sessions`, `payments`, `attempts`, `refunds`, `domain_events`,
+> `webhook_endpoints`, `outbound_webhook_deliveries`, `inbound_webhook_events`,
+> `idempotency_records`. **No** crea `customers`, `instruments`, `checkouts`,
+> `subscriptions`, `invoices`, `plans`, `payment_links` ni `disputes`. Prisma 7: los
+> comandos de migración usan `--config prisma/prisma.config.ts`.
+
 #### Fase 0 — Bootstrap (~semana 1)
-Repo, Docker, CI, lint, tests triviales verdes, `/health`, `/ready`, docs base en el repo
+Repo, Docker, CI, lint, tests triviales verdes, `/health` (`/ready` queda como roadmap, no se construyó), docs base en el repo
 del back (`Kunfupay-Payins-Back/docs/projectbrief.md`, `Kunfupay-Payins-Back/docs/domain.md`,
 `Kunfupay-Payins-Back/docs/architecture/*`, `Kunfupay-Payins-Back/AGENTS.md`,
 `Kunfupay-Payins-Back/CLAUDE.md`). Toolkit `utils/`: `Money`, `Currency`, `Country`, enums
@@ -1461,8 +1531,8 @@ de catálogo, `AppError`/`ErrorKind`, `ILogger` chain, `IClock`, `IIDGenerator` 
 #### Fase 2 — `account` + eventos + webhooks I/O + `customer` + `instrument` + `contract` (~semanas 4‑5)
 - Migraciones `003_account` (`accounts` + auto‑create del Account `"default"` para cada Platform), `004_events` (`domain_events` en `common/events`), `005_inbound_webhooks` (`inbound_webhook_events` en `common/inboundWebhooks`), `006_webhook_outbound` (`webhook_endpoints` + `webhook_deliveries`, BC), `007_customer`, `008_instrument`, `009_contract`.
 - `account`: `Account` como raíz de propiedad; resolución de Account default implícito.
-- `common/events`: `DomainEvent` outbox + `IEventPublisher`.
-- `common/inboundWebhooks`: `InboundWebhookEvent` + dedupe `(connectionId, providerEventId)` + ingress `POST /v1/webhooks/:providerSlug/:connectionId` con NoopAdapter.
+- `common/events`: `DomainEvent` outbox + `IEventPublisher` + `PrismaEventStore`. **Estado:** construido pero **no cableado** — ningún use case emite eventos aún y los webhooks salientes se encolan directamente; el proyector evento→delivery queda pendiente (ver §3.2 / §5.10).
+- `common/inboundWebhooks`: `InboundWebhookEvent` + dedupe `(connectionId, providerEventId)` + ingress `POST /v1/webhooks/:provider` con NoopAdapter (el `connectionId` es interno al dedupe, no es segmento de URL).
 - `webhook-outbound`: `WebhookEndpoint` CRUD consumer‑facing + `WebhookDelivery` dispatcher con reintentos + cron retry.
 - `customer`, `instrument` (entidades + repos account‑scoped), `contract` + `ContractTerm` + resolver de término aplicable.
 
@@ -1693,7 +1763,7 @@ apuntando al back vía `host.docker.internal:1464`).
 4. **Mock de Ebanx**: construir en Fase 9 (1‑2 días).
 5. **FX entre currencies**: fuera de v1.
 6. **Comisiones v1**: solo en `Contract.currency` === `Payment.currency`. v2 añade conversión.
-7. **Retention de `WebhookDelivery` FAILED_DEAD**: 90 días default.
+7. **Retention de `OutboundWebhookDelivery` en estado terminal `EXHAUSTED`**: 90 días default.
 8. **Multi‑tenant desde día 1**: sí, con ≥2 Platforms en e2e.
 9. **Payment Link domain**: subdominio dedicado `pay.example.com` o path `/l/…` dentro del mismo host. — Recomendación: path en v1, subdominio opcional en v2.
 10. **Comisiones: accounting treatment**: en v1 la commission se **calcula y registra** pero **no se cobra** al consumidor (Payins no debita). v2 puede añadir Wallet‑style ledger para cobro.
@@ -1702,7 +1772,7 @@ apuntando al back vía `host.docker.internal:1464`).
 11. **Modelo de tenancy**: `Platform` (tenant, API key propia) + `Account` (raíz de propiedad account‑scoped); **sin** `Organization` ni tabla `ApiCredential` separada, **sin** flag `mode`. — Resuelto.
 12. **IDs**: **UUID v7** (RFC 9562) generados en app vía `IIDGenerator`; nunca UUID v4; los prefijos semánticos son solo pista de legibilidad. — Resuelto (era ULID).
 13. **Datos de referencia**: providers/métodos/países/monedas son **enums en `utils/kernel/`**, no tablas DB; no hay BC `catalog` ni migración de catálogo. — Resuelto.
-14. **Concurrencia**: modelo de **dos capas** (`LockRunner` distribuido Redis + optimistic locking `version` + `Serializable`, 5 reintentos internos full‑jitter). — Resuelto (era "Serializable + 3 retries").
+14. **Concurrencia**: modelo de **dos capas** (`LockRunner` distribuido Redis + optimistic locking `version` + `Serializable`, hasta **3 intentos** internos con backoff exponencial determinista 30ms/60ms, sin jitter). — Resuelto.
 15. **Timestamps**: **Unix‑ms (BigInt)** como representación única interna y en DB; ISO‑8601 solo en payloads públicos de webhooks. — Resuelto (antes se modelaban como columnas de fecha/hora con zona e ISO‑8601 interno).
 
 ---
@@ -1736,18 +1806,18 @@ Ninguna de estas referencias condiciona el diseño ni el calendario de Payins.
 - [x] Multi‑provider (Registry + port declarativo).
 - [x] Multi‑país (campo `country` en Capability/Contract/Customer/Payment).
 - [x] Multi‑método con mapeo many‑to‑many contra providers (Capability).
-- [x] Flujos distintos (`FlowType`: REDIRECT, REDIRECT_ASYNC, ONSITE_TOKEN, ONSITE_DIRECT, ENROLLMENT).
+- [x] Flujos distintos (`FlowType`: REDIRECT, ONSITE_TOKEN, REDIRECT_ASYNC, DISPLAY, ENROLLMENT, PUSH_TO_APP — los 6 reales del enum `FLOW_TYPES`).
 - [x] Tres arquetipos de recurrencia (`RecurrenceStrategy`: NONE, AUTO_PROVIDER, MANAGED, REMINDER).
-- [x] Pagos one‑time + suscripciones + payment links + refunds + disputes como ciudadanos primera clase.
+- [~] Pagos one‑time + refunds: **construidos**. Suscripciones, payment links y disputes: **modelados como ciudadanos de primera clase en el diseño, aún no implementados** (roadmap).
 - [x] **Contratos comerciales con comisión/markup por scope** (Contract + ContractTerm).
 - [x] **Montos siempre enteros** (BIGINT minor units), porcentajes en basis points.
 - [x] **IDs UUID v7** (RFC 9562) generados en app vía `IIDGenerator`; nunca UUID v4 (no ULID).
 - [x] **Timestamps Unix‑ms (BigInt)** como representación única interna y en DB; ISO‑8601 solo en payloads públicos de webhooks.
 - [x] **Datos de referencia en código** (`utils/kernel/`): providers/métodos/países/monedas como enums, no tablas DB; no hay BC `catalog`.
 - [x] **Tenancy `Platform` + `Account`** (no `Organization`); API key sobre el `Platform`; sin flag `mode`; account‑scoped lleva `platformId` + `accountId` NOT NULL.
-- [x] **Concurrencia de dos capas** (`LockRunner` distribuido Redis + optimistic locking + `Serializable`, 5 reintentos internos).
+- [x] **Concurrencia de dos capas** (`LockRunner` distribuido Redis + optimistic locking + `Serializable`, hasta 3 intentos internos, backoff determinista 30/60ms).
 - [x] Webhooks entrantes (verificación + parseo + dedupe + normalización) y salientes (firma + reintentos + replay).
-- [x] Event log auditable (`DomainEvent`).
+- [~] Event log auditable (`DomainEvent`): tabla `domain_events` + puerto `IEventPublisher` + `PrismaEventStore` **construidos pero dormidos** (ningún use case emite eventos aún; webhooks salientes encolados directamente).
 - [x] Una integración a la vez en el plan; arquitectura cerrada tras la fase de payment/contract.
 - [x] Feature flag por provider; doc por provider.
 - [x] Multi‑tenant desde día 1 con tests de aislamiento (Platform y Account) obligatorios.

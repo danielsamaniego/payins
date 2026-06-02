@@ -55,9 +55,12 @@ submodule registry.
 **Payins** is a standalone, multi-tenant payment-in orchestration platform. The
 **backend** is a Hono service that orchestrates multiple external providers
 (Stripe, Ebanx) across many methods (card, Pix, Boleto, PSE, Yape, Nequi, PLIN,
-MercadoPago via Ebanx), countries, and currencies to execute one-time payments,
-subscriptions (auto-provider, managed, reminder), payment links, refunds, and disputes.
-Inbound provider webhooks are normalized into a stable, signed outbound event contract.
+MercadoPago via Ebanx), countries, and currencies to execute one-time payments and
+refunds today; subscriptions (auto-provider, managed, reminder), payment links, and
+disputes are planned / not yet implemented (no model, route, or use case exists — the
+only trace is the dormant `RECURRENCE_STRATEGIES` kernel constant, and the inbound
+dispatcher acts only on payment captured/failed/refunded events). Inbound provider
+webhooks are normalized into a stable, signed outbound event contract.
 
 The **frontend** repo ships two Next.js apps: `apps/checkout` (public, payer-facing —
 renders hosted / embedded UI per `FlowType` for the methods Payins integrates natively)
@@ -94,11 +97,19 @@ These rules cross the seam between the two repos. They are restated in each chil
 - **Country:** ISO-3166-1 alpha-2 uppercase. **Currency:** ISO-4217 uppercase.
 - **PCI:** Payins **never** accepts or stores PAN/CVV — only provider tokens. The
   provider's browser SDK (Stripe.js, Ebanx fields) tokenizes in the user's browser; the
-  token is what hits the backend. CI gate (back repo):
+  token is what hits the backend. Intended gate (back repo):
   `rg -iE "pan|cvv|card.?number"` outside `src/provider-adapters/` must be empty.
+  **Enforcement: not yet wired (TODO).** This is currently a policy/review rule, not a
+  pipeline check — CI (`Kunfupay-Payins-Back/.github/workflows/ci.yml`) runs only Biome,
+  `tsc --noEmit`, and unit tests; pre-commit runs Biome + `check-layer-violations.cjs` +
+  `check-financial-patterns.cjs` (float-on-money only); pre-push runs the type-checks.
 - **Consumer isolation:** No file in either repo references a specific consumer
-  product. CI gate: `rg -i "kunfupay|sale|order|product"` under source trees must be
-  empty.
+  product. Intended gate: `rg -i "kunfupay|sale|order|product"` under source trees must
+  be empty. **Enforcement: not yet wired (TODO)** — no banned-term scan exists in either
+  repo's CI or hooks (the front has no `.github/workflows` at all). Treat this as a
+  policy/review rule until the scan is added. (Note: `kunfupay` is the vendor name, not a
+  consumer product; the rule targets concrete product/business terms like "sale",
+  "order", "product".)
 
 ## Cross-repo workflow
 
@@ -116,8 +127,10 @@ Reference flows that need to stay in sync:
 - **API contract:** `Kunfupay-Payins-Back/src/.../routes` defines it via
   `hono-openapi` → emitted as `/openapi`. `Kunfupay-Payins-Front/packages/api-client`
   consumes that spec.
-- **Banned terms / PCI gates:** same regex on both sides, enforced in each repo's own
-  CI / pre-commit (see each `AGENTS.md`).
+- **Banned terms / PCI gates:** same regex intended on both sides (see each
+  `AGENTS.md`). These are policy/review rules today — the regex scans are **not yet
+  wired** into either repo's CI or pre-commit hooks. When added, both sides should run
+  the identical regex.
 
 ## Cross-cutting docs
 
